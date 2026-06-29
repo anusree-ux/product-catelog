@@ -1,129 +1,171 @@
 #!/bin/bash
-
-set -e
+set -euo pipefail
 
 CLUSTER_NAME="devops-lab"
+LOG_FILE="bootstrap-$(date +%s).log"
 
-echo "========================================"
-echo " Bootstrapping Kind Kubernetes Cluster"
-echo "========================================"
+# -----------------------------
+# Resolve project root (IMPORTANT FIX)
+# -----------------------------
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo ""
-echo "Checking prerequisites..."
+# -----------------------------
+# Logging
+# -----------------------------
+log() {
+  echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
 
-command -v docker >/dev/null || { echo "Docker is not installed."; exit 1; }
-command -v kind >/dev/null || { echo "Kind is not installed."; exit 1; }
-command -v kubectl >/dev/null || { echo "kubectl is not installed."; exit 1; }
-command -v helm >/dev/null || { echo "Helm is not installed."; exit 1; }
+fail() {
+  log "❌ ERROR: $1"
+  exit 1
+}
 
-echo ""
-echo "Creating Kind cluster..."
+# -----------------------------
+# SAFE retry (NO eval)
+# -----------------------------
+retry() {
+  local max=$1
+  shift
 
-kind delete cluster --name ${CLUSTER_NAME} || true
+  for i in $(seq 1 "$max"); do
+    log "🔁 Attempt $i/$max: $*"
+    if "$@"; then
+      return 0
+    fi
+    sleep 5
+  done
 
-kind create cluster \
-  --name ${CLUSTER_NAME} \
-  --config kubernetes/kind-config.yaml
+  fail "Command failed after $max attempts: $*"
+}
 
-echo ""
-echo "Loading application images..."
+trap 'fail "Script failed at line $LINENO"' ERR
 
-docker build -t product-api:v1 ./backend
-docker build -t product-web:v1 ./frontend
+# -----------------------------
+# Cleanup for port-forward
+# -----------------------------
+cleanup() {
+  log "🧹 Cleaning up background processes"
+  kill "${PF_PID:-}" 2>/dev/null || true
+}
+trap cleanup EXIT
 
-kind load docker-image product-api:v1 --name ${CLUSTER_NAME}
-kind load docker-image product-web:v1 --name ${CLUSTER_NAME}
+# -----------------------------
+log "🚀 Starting Kind Bootstrap"
 
-echo ""
-echo "Installing ingress-nginx..."
+command -v docker >/dev/null || fail "Docker missing"
+command -v kind >/dev/null || fail "Kind missing"
+command -v kubectl >/dev/null || fail "kubectl missing"
+command -v helm >/dev/null || fail "Helm missing"
 
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null 2>&1 || true
+# -----------------------------
+# Cluster reset
+# -----------------------------
+log "🧹 Deleting old cluster"
+kind delete cluster --name "$CLUSTER_NAME" || true
+
+log "📦 Creating cluster"
+kind create cluster --name "$CLUSTER_NAME" --config kubernetes/kind-config.yaml
+
+retry 10 kubectl wait --for=condition=Ready nodes --all --timeout=120s
+
+# -----------------------------
+# Build images (ROOT FIX APPLIED)
+# -----------------------------
+log "🔨 Building backend"
+docker build -t product-catalog-backend:v1 "$ROOT_DIR/backend"
+
+log "🔨 Building frontend"
+docker build -t product-catalog-frontend:v1 "$ROOT_DIR/frontend"
+
+log "📦 Loading images into Kind"
+kind load docker-image product-catalog-backend:v1 --name "$CLUSTER_NAME"
+kind load docker-image product-catalog-frontend:v1 --name "$CLUSTER_NAME"
+
+# -----------------------------
+# Namespaces
+# -----------------------------
+log "📁 Creating namespaces"
+kubectl create ns monitoring --dry-run=client -o yaml | kubectl apply -f -
+kubectl create ns logging --dry-run=client -o yaml | kubectl apply -f -
+
+# -----------------------------
+# Ingress
+# -----------------------------
+log "🌐 Installing ingress-nginx"
+
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null || true
 helm repo update
 
 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
-    --namespace ingress-nginx \
-    --create-namespace
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.service.type=NodePort \
+  --set controller.service.nodePorts.http=30080 \
+  --set controller.service.nodePorts.https=30443
 
-echo ""
-echo "Installing Prometheus & Grafana..."
+retry 20 kubectl rollout status deployment -n ingress-nginx ingress-nginx-controller --timeout=120s
 
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
+# -----------------------------
+# Monitoring
+# -----------------------------
+log "📊 Installing monitoring stack"
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null || true
 helm repo update
 
 helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
-    --namespace monitoring \
-    --create-namespace
+  --namespace monitoring \
+  --create-namespace
 
-echo ""
-echo "Installing Loki..."
+retry 30 kubectl wait --for=condition=Ready pods -n monitoring --all --timeout=180s
 
-helm repo add grafana https://grafana.github.io/helm-charts >/dev/null 2>&1 || true
-helm repo update
+# -----------------------------
+# Deploy apps
+# -----------------------------
+log "🚀 Deploying applications"
+kubectl apply -k "$ROOT_DIR/kubernetes/k8s/overlays/dev"
 
-helm upgrade --install loki grafana/loki \
-    --namespace logging \
-    --create-namespace
+retry 20 kubectl rollout status deployment/api --timeout=120s
+retry 20 kubectl rollout status deployment/web --timeout=120s
+retry 20 kubectl rollout status deployment/postgres --timeout=120s
 
-echo ""
-echo "Installing Promtail..."
+# -----------------------------
+# Validate endpoints
+# -----------------------------
+log "🔎 Checking endpoints"
+retry 10 kubectl get endpoints api | grep -q api
+retry 10 kubectl get endpoints web | grep -q web
 
-helm upgrade --install loki-promtail grafana/promtail \
-    --namespace logging
+# -----------------------------
+# Ingress functional test (FIXED)
+# -----------------------------
+log "🌐 Testing ingress"
 
-echo ""
-echo "Deploying application..."
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 >/dev/null 2>&1 &
+PF_PID=$!
 
-kubectl apply -k kubernetes/k8s/overlays/dev
+sleep 5
 
-echo ""
-echo "Applying Network Policies..."
+retry 10 curl -sf -H "Host: localhost" http://localhost:8080/api/health
+retry 10 curl -sf -H "Host: localhost" http://localhost:8080/api/products
 
-kubectl apply -f kubernetes/k8s/base/network/
+# -----------------------------
+# Final status
+# -----------------------------
+log "📡 Cluster status"
+kubectl get nodes | tee -a "$LOG_FILE"
+kubectl get pods -A | tee -a "$LOG_FILE"
+kubectl get svc -A | tee -a "$LOG_FILE"
+kubectl get ingress -A | tee -a "$LOG_FILE"
 
-echo ""
-echo "Waiting for deployments..."
+log "========================================"
+log "🎉 BOOTSTRAP SUCCESSFUL"
+log "========================================"
 
-kubectl wait \
-  --for=condition=Available \
-  deployment/postgres \
-  --timeout=300s
+log "🌍 App: http://localhost"
+log "🌍 API: http://localhost/api/products"
+log "📊 Grafana: kubectl port-forward svc/monitoring-grafana 3000:80 -n monitoring"
+log "📈 Prometheus: kubectl port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090 -n monitoring"
 
-kubectl wait \
-  --for=condition=Available \
-  deployment/api \
-  --timeout=300s
-
-kubectl wait \
-  --for=condition=Available \
-  deployment/web \
-  --timeout=300s
-
-echo ""
-echo "========================================"
-echo " Deployment Successful"
-echo "========================================"
-
-echo ""
-kubectl get pods
-
-echo ""
-kubectl get svc
-
-echo ""
-kubectl get ingress
-
-echo ""
-echo "Application:"
-echo "http://localhost"
-
-echo ""
-echo "API:"
-echo "http://localhost/api/products"
-
-echo ""
-echo "Grafana:"
-echo "kubectl port-forward svc/monitoring-grafana 3000:80 -n monitoring"
-
-echo ""
-echo "Prometheus:"
-echo "kubectl port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090 -n monitoring"
+log "📝 Log file: $LOG_FILE"

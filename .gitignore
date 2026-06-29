@@ -11,17 +11,12 @@ frontend/dist/
 .env
 environments/local/.env
 
-# Docker
-*.log
+# IDE
+.vscode/
+.idea/
 
-# macOS/Linux
+# OS
 .DS_Store
 
-# VS Code
-.vscode/
-
-# Terraform (if added later)
-.terraform/
-
-# Kubernetes temp files
-*.swp
+# Logs
+*.log
