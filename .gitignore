@@ -1,0 +1,27 @@
+# Python
+backend/venv/
+__pycache__/
+*.pyc
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Environment
+.env
+environments/local/.env
+
+# Docker
+*.log
+
+# macOS/Linux
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Terraform (if added later)
+.terraform/
+
+# Kubernetes temp files
+*.swp
