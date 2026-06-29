@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - postgres/deployment.yaml
+  - postgres/service.yaml
+
+  - api/deployment.yaml
+  - api/service.yaml
+
+  - web/deployment.yaml
+  - web/service.yaml
+
+  - ingress.yaml
+
+  - network/default-deny.yaml
+  - network/allow-dns.yaml
+  - network/allow-api-to-postgres.yaml
+  - network/allow-api-egress.yaml
+  - network/allow-web-to-api.yaml
+  - network/allow-ingress-web.yaml
